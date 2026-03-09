@@ -613,12 +613,17 @@
 }
 
 .text-edit-item-edited {
-  background: rgba(255, 200, 50, 0.15);
+  background: white;
   box-shadow: 0 0 0 1px rgba(200, 160, 0, 0.35);
 }
 
 .text-edit-item-edited:hover {
-  background: rgba(255, 200, 50, 0.25);
+  background: white;
+}
+
+.text-edit-item-edited .text-edit-label {
+  color: #000;
+  background: white;
 }
 
 .text-edit-item-active {

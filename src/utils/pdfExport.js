@@ -1,8 +1,41 @@
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib'
 
 /**
+ * Map a PDF font name to the best matching StandardFont.
+ * PDF font names often look like "ABCDEF+TimesNewRoman-Bold" or "ArialMT" etc.
+ */
+function pickStandardFont(fontName) {
+  const name = (fontName || '').toLowerCase()
+  const isBold = /bold/.test(name)
+  const isItalic = /italic|oblique/.test(name)
+
+  // Times / Serif family
+  if (/times|serif|roman|garamond|georgia|cambria|palatino/.test(name)) {
+    if (isBold && isItalic) return StandardFonts.TimesRomanBoldItalic
+    if (isBold) return StandardFonts.TimesRomanBold
+    if (isItalic) return StandardFonts.TimesRomanItalic
+    return StandardFonts.TimesRoman
+  }
+
+  // Courier / Monospace family
+  if (/courier|mono|consolas|menlo|source\s?code/.test(name)) {
+    if (isBold && isItalic) return StandardFonts.CourierBoldOblique
+    if (isBold) return StandardFonts.CourierBold
+    if (isItalic) return StandardFonts.CourierOblique
+    return StandardFonts.Courier
+  }
+
+  // Default: Helvetica / Sans-serif (covers Arial, Helvetica, Calibri, etc.)
+  if (isBold && isItalic) return StandardFonts.HelveticaBoldOblique
+  if (isBold) return StandardFonts.HelveticaBold
+  if (isItalic) return StandardFonts.HelveticaOblique
+  return StandardFonts.Helvetica
+}
+
+/**
  * Export the edited PDF with all annotations, form values, AND inline text edits baked in.
  * For text edits: draws a white rectangle over the original text, then draws the new text.
+ * Tries to match the original font family as closely as possible using PDF standard fonts.
  * Everything runs client-side.
  */
 export async function exportPdf(
@@ -17,9 +50,19 @@ export async function exportPdf(
   const pdfDoc = await PDFDocument.load(originalPdfData, { ignoreEncryption: true })
   const pages = pdfDoc.getPages()
 
-  // Embed fonts upfront
-  const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica)
-  const helveticaBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold)
+  // Cache embedded fonts to avoid embedding the same font multiple times
+  const fontCache = {}
+  async function getFont(fontName) {
+    const stdFont = pickStandardFont(fontName)
+    if (!fontCache[stdFont]) {
+      fontCache[stdFont] = await pdfDoc.embedFont(stdFont)
+    }
+    return fontCache[stdFont]
+  }
+
+  // Pre-embed Helvetica for annotations/forms
+  const helvetica = await getFont('')
+  const helveticaBold = await getFont('bold')
 
   for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
     const page = pages[pageIdx]
@@ -48,9 +91,8 @@ export async function exportPdf(
         borderWidth: 0,
       })
 
-      // Choose font — try to match bold if font name suggests it
-      const isBold = item.fontName && /bold/i.test(item.fontName)
-      const font = isBold ? helveticaBold : helvetica
+      // Choose the closest matching standard font based on the original font name
+      const font = await getFont(item.fontName)
 
       // Draw the new text at the same position
       const fontSize = item.fontSize

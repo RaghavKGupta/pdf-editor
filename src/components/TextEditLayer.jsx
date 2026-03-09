@@ -121,10 +121,21 @@ export default function TextEditLayer({
                 style={{
                   fontSize: item.fontSize * scale * 0.9,
                   lineHeight: `${screenH}px`,
+                  // When edited, show the new text with a white background to cover the original canvas text
+                  ...(edited ? {
+                    background: 'white',
+                    color: '#000',
+                    display: 'inline-block',
+                    padding: '0 2px',
+                    whiteSpace: 'nowrap',
+                    fontFamily: 'Helvetica, Arial, sans-serif',
+                    fontWeight: item.fontName && /bold/i.test(item.fontName) ? 'bold' : 'normal',
+                    fontStyle: item.fontName && /italic|oblique/i.test(item.fontName) ? 'italic' : 'normal',
+                  } : {})
                 }}
                 title={edited ? `Original: "${item.originalStr}"` : 'Click to edit'}
               >
-                {/* Invisible text just for sizing — the real text shows through the PDF canvas */}
+                {edited ? currentText : ''}
               </span>
             )}
           </div>
