@@ -597,6 +597,58 @@
   }
 }
 
+/* Text Edit Layer */
+.text-edit-layer {
+  cursor: default;
+}
+
+.text-edit-item {
+  border-radius: 2px;
+  transition: background 0.1s, box-shadow 0.1s;
+}
+
+.text-edit-item:hover {
+  background: rgba(0, 113, 227, 0.08);
+  box-shadow: 0 0 0 1px rgba(0, 113, 227, 0.25);
+}
+
+.text-edit-item-edited {
+  background: rgba(255, 200, 50, 0.15);
+  box-shadow: 0 0 0 1px rgba(200, 160, 0, 0.35);
+}
+
+.text-edit-item-edited:hover {
+  background: rgba(255, 200, 50, 0.25);
+}
+
+.text-edit-item-active {
+  background: rgba(0, 113, 227, 0.05);
+  box-shadow: 0 0 0 2px var(--primary);
+  z-index: 10;
+}
+
+.text-edit-input {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.95);
+  border: none;
+  outline: none;
+  padding: 0 2px;
+  color: #1d1d1f;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  box-shadow: 0 0 0 2px var(--primary), 0 2px 8px rgba(0,0,0,0.12);
+  border-radius: 2px;
+}
+
+.text-edit-label {
+  display: block;
+  width: 100%;
+  height: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  user-select: none;
+  color: transparent; /* invisible — PDF shows through */
+}
+
 /* Responsive */
 @media (max-width: 768px) {
   .header {

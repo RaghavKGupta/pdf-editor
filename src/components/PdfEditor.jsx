@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import * as pdfjsLib from 'pdfjs-dist'
 import SignatureModal from './SignatureModal'
+import TextEditLayer from './TextEditLayer'
 import { exportPdf } from '../utils/pdfExport'
 
 // Set worker
@@ -11,6 +12,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
 
 const TOOLS = {
   SELECT: 'select',
+  EDIT: 'edit',
   TEXT: 'text',
   SIGNATURE: 'signature',
 }
@@ -20,14 +22,19 @@ export default function PdfEditor({ pdfData, fileName }) {
   const [pages, setPages] = useState([])
   const [scale, setScale] = useState(1.2)
   const [activeTool, setActiveTool] = useState(TOOLS.SELECT)
-  const [annotations, setAnnotations] = useState({}) // { pageNum: [...annotations] }
+  const [annotations, setAnnotations] = useState({})
   const [showSignatureModal, setShowSignatureModal] = useState(false)
   const [savedSignature, setSavedSignature] = useState(null)
   const [loading, setLoading] = useState(true)
   const [exporting, setExporting] = useState(false)
   const [toast, setToast] = useState(null)
-  const [formFields, setFormFields] = useState({}) // { pageNum: [...fields] }
-  const [formValues, setFormValues] = useState({}) // { fieldId: value }
+  const [formFields, setFormFields] = useState({})
+  const [formValues, setFormValues] = useState({})
+
+  // Text editing state: extracted text items per page and user edits
+  const [pageTextItems, setPageTextItems] = useState({}) // { pageNum: [{ id, str, x, y, width, height, fontName, fontSize, transform }] }
+  const [textEdits, setTextEdits] = useState({}) // { "pageNum-itemId": newText }
+
   const canvasRefs = useRef({})
   const dragRef = useRef(null)
 
@@ -63,7 +70,6 @@ export default function PdfEditor({ pdfData, fileName }) {
         }
         setFormFields(fields)
 
-        // Pre-fill form values from existing field values
         const values = {}
         for (const [, pageFieldList] of Object.entries(fields)) {
           for (const field of pageFieldList) {
@@ -73,6 +79,47 @@ export default function PdfEditor({ pdfData, fileName }) {
           }
         }
         setFormValues(values)
+
+        // Extract text content from each page
+        const allTextItems = {}
+        for (const page of loadedPages) {
+          const textContent = await page.getTextContent()
+          const viewport = page.getViewport({ scale: 1 }) // base scale=1 for PDF coords
+          const items = []
+
+          textContent.items.forEach((item, idx) => {
+            if (!item.str || !item.str.trim()) return
+
+            // item.transform = [scaleX, skewY, skewX, scaleY, translateX, translateY]
+            const tx = item.transform
+            const fontSize = Math.sqrt(tx[0] * tx[0] + tx[1] * tx[1])
+            const x = tx[4]
+            const y = tx[5]
+
+            // Width comes from item.width (in PDF units)
+            const width = item.width
+            const height = item.height || fontSize * 1.2
+
+            items.push({
+              id: idx,
+              str: item.str,
+              x,
+              y, // PDF y (from bottom)
+              width,
+              height,
+              fontSize,
+              fontName: item.fontName || '',
+              transform: tx,
+              // Store original for export diffing
+              originalStr: item.str,
+            })
+          })
+
+          if (items.length > 0) {
+            allTextItems[page.pageNumber] = items
+          }
+        }
+        setPageTextItems(allTextItems)
       } catch (err) {
         console.error('Failed to load PDF:', err)
         showToast('Failed to load PDF')
@@ -103,7 +150,7 @@ export default function PdfEditor({ pdfData, fileName }) {
 
   // Handle click on page to add annotations
   const handlePageClick = useCallback((e, pageNum) => {
-    if (activeTool === TOOLS.SELECT) return
+    if (activeTool === TOOLS.SELECT || activeTool === TOOLS.EDIT) return
 
     const rect = e.currentTarget.getBoundingClientRect()
     const x = e.clientX - rect.left
@@ -159,7 +206,7 @@ export default function PdfEditor({ pdfData, fileName }) {
     }))
   }, [])
 
-  // Drag handling
+  // Drag handling for annotations
   const handleDragStart = useCallback((e, pageNum, annotId) => {
     e.stopPropagation()
     const rect = e.currentTarget.parentElement.getBoundingClientRect()
@@ -189,11 +236,20 @@ export default function PdfEditor({ pdfData, fileName }) {
     document.addEventListener('mouseup', onUp)
   }, [updateAnnotation])
 
+  // Text edit handler
+  const handleTextEdit = useCallback((pageNum, itemId, newText) => {
+    const key = `${pageNum}-${itemId}`
+    setTextEdits(prev => ({
+      ...prev,
+      [key]: newText,
+    }))
+  }, [])
+
   // Export PDF
   const handleExport = useCallback(async () => {
     setExporting(true)
     try {
-      const blob = await exportPdf(pdfData, annotations, formValues, formFields, scale)
+      const blob = await exportPdf(pdfData, annotations, formValues, formFields, scale, textEdits, pageTextItems)
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
@@ -206,7 +262,7 @@ export default function PdfEditor({ pdfData, fileName }) {
       showToast('Export failed. Please try again.')
     }
     setExporting(false)
-  }, [pdfData, annotations, formValues, formFields, scale, fileName, showToast])
+  }, [pdfData, annotations, formValues, formFields, scale, fileName, showToast, textEdits, pageTextItems])
 
   const handleSignatureSave = useCallback((dataUrl) => {
     setSavedSignature(dataUrl)
@@ -219,6 +275,7 @@ export default function PdfEditor({ pdfData, fileName }) {
   const zoomOut = () => setScale(s => Math.max(0.4, s - 0.2))
 
   const hasFormFields = Object.keys(formFields).length > 0
+  const editCount = Object.keys(textEdits).length
 
   return (
     <>
@@ -232,6 +289,14 @@ export default function PdfEditor({ pdfData, fileName }) {
             title="Select / Move"
           >
             ↖
+          </button>
+          <button
+            className={`btn-icon ${activeTool === TOOLS.EDIT ? 'active' : ''}`}
+            onClick={() => setActiveTool(TOOLS.EDIT)}
+            title="Edit existing text"
+            style={{ fontWeight: 700, fontStyle: 'italic' }}
+          >
+            ✎
           </button>
           <button
             className={`btn-icon ${activeTool === TOOLS.TEXT ? 'active' : ''}`}
@@ -254,6 +319,15 @@ export default function PdfEditor({ pdfData, fileName }) {
             ✍
           </button>
         </div>
+
+        {activeTool === TOOLS.EDIT && (
+          <div className="toolbar-group">
+            <span style={{ fontSize: 12, color: 'var(--primary)' }}>
+              Click on any text to edit it
+              {editCount > 0 && <> &middot; {editCount} edit{editCount !== 1 ? 's' : ''}</>}
+            </span>
+          </div>
+        )}
 
         {savedSignature && (
           <div className="toolbar-group">
@@ -313,11 +387,23 @@ export default function PdfEditor({ pdfData, fileName }) {
                   style={{ width: viewport.width, height: viewport.height }}
                 />
 
+                {/* Text edit layer — shown when Edit tool is active */}
+                {activeTool === TOOLS.EDIT && (
+                  <TextEditLayer
+                    pageNum={page.pageNumber}
+                    textItems={pageTextItems[page.pageNumber] || []}
+                    textEdits={textEdits}
+                    onEdit={handleTextEdit}
+                    scale={scale}
+                    pageHeight={page.getViewport({ scale: 1 }).height}
+                    viewportHeight={viewport.height}
+                  />
+                )}
+
                 {/* Form fields layer */}
                 {pageFormFields.map((field) => {
                   const [x1, y1, x2, y2] = field.rect
                   const vs = page.getViewport({ scale })
-                  // Convert PDF coords to canvas coords
                   const left = x1 * scale
                   const bottom = y1 * scale
                   const width = (x2 - x1) * scale
@@ -328,9 +414,7 @@ export default function PdfEditor({ pdfData, fileName }) {
                     <div
                       key={field.id}
                       className="form-field-highlight"
-                      style={{
-                        left, top, width, height,
-                      }}
+                      style={{ left, top, width, height }}
                     >
                       {field.fieldType === 'Tx' && (
                         <input
@@ -357,9 +441,9 @@ export default function PdfEditor({ pdfData, fileName }) {
                   )
                 })}
 
-                {/* Annotations layer */}
+                {/* Annotations layer (add text / signatures) */}
                 <div
-                  className={`annotations-layer ${activeTool !== TOOLS.SELECT ? 'interactive' : ''}`}
+                  className={`annotations-layer ${(activeTool === TOOLS.TEXT || activeTool === TOOLS.SIGNATURE) ? 'interactive' : ''}`}
                   onClick={(e) => handlePageClick(e, page.pageNumber)}
                 >
                   {pageAnnots.map((annot) => {
@@ -380,10 +464,7 @@ export default function PdfEditor({ pdfData, fileName }) {
                             className="text-annotation-input"
                             value={annot.text}
                             placeholder="Type here…"
-                            style={{
-                              fontSize: annot.fontSize,
-                              color: annot.color,
-                            }}
+                            style={{ fontSize: annot.fontSize, color: annot.color }}
                             onChange={(e) => {
                               updateAnnotation(page.pageNumber, annot.id, { text: e.target.value })
                             }}
@@ -407,10 +488,7 @@ export default function PdfEditor({ pdfData, fileName }) {
                         <div
                           key={annot.id}
                           className="signature-annotation"
-                          style={{
-                            left: annot.x,
-                            top: annot.y,
-                          }}
+                          style={{ left: annot.x, top: annot.y }}
                           onMouseDown={(e) => handleDragStart(e, page.pageNumber, annot.id)}
                           onClick={(e) => e.stopPropagation()}
                         >
@@ -434,26 +512,21 @@ export default function PdfEditor({ pdfData, fileName }) {
                             onMouseDown={(e) => {
                               e.stopPropagation()
                               const startX = e.clientX
-                              const startY = e.clientY
                               const startW = annot.width
                               const startH = annot.height
                               const ratio = startW / startH
-
                               const onMove = (ev) => {
                                 const dx = ev.clientX - startX
                                 const newW = Math.max(50, startW + dx)
-                                const newH = newW / ratio
                                 updateAnnotation(page.pageNumber, annot.id, {
                                   width: newW,
-                                  height: newH,
+                                  height: newW / ratio,
                                 })
                               }
-
                               const onUp = () => {
                                 document.removeEventListener('mousemove', onMove)
                                 document.removeEventListener('mouseup', onUp)
                               }
-
                               document.addEventListener('mousemove', onMove)
                               document.addEventListener('mouseup', onUp)
                             }}
@@ -461,18 +534,14 @@ export default function PdfEditor({ pdfData, fileName }) {
                         </div>
                       )
                     }
-
                     return null
                   })}
                 </div>
 
-                {/* Page number label */}
+                {/* Page number */}
                 <div style={{
-                  textAlign: 'center',
-                  padding: '6px 0',
-                  fontSize: 12,
-                  color: 'var(--text-secondary)',
-                  background: '#f8f8f8',
+                  textAlign: 'center', padding: '6px 0', fontSize: 12,
+                  color: 'var(--text-secondary)', background: '#f8f8f8',
                   borderTop: '1px solid #eee',
                 }}>
                   Page {page.pageNumber} of {pages.length}
@@ -483,7 +552,6 @@ export default function PdfEditor({ pdfData, fileName }) {
         </div>
       </div>
 
-      {/* Signature Modal */}
       {showSignatureModal && (
         <SignatureModal
           onSave={handleSignatureSave}
@@ -491,7 +559,6 @@ export default function PdfEditor({ pdfData, fileName }) {
         />
       )}
 
-      {/* Export overlay */}
       {exporting && (
         <div className="loading-overlay">
           <div className="spinner" />
@@ -499,7 +566,6 @@ export default function PdfEditor({ pdfData, fileName }) {
         </div>
       )}
 
-      {/* Toast */}
       {toast && <div className="toast">{toast}</div>}
     </>
   )

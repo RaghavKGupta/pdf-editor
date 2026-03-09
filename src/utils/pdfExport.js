@@ -1,33 +1,89 @@
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib'
 
 /**
- * Export the edited PDF with all annotations and form values baked in.
- * Everything runs client-side — no server needed.
+ * Export the edited PDF with all annotations, form values, AND inline text edits baked in.
+ * For text edits: draws a white rectangle over the original text, then draws the new text.
+ * Everything runs client-side.
  */
-export async function exportPdf(originalPdfData, annotations, formValues, formFields, viewScale) {
-  // Load the original PDF
+export async function exportPdf(
+  originalPdfData,
+  annotations,
+  formValues,
+  formFields,
+  viewScale,
+  textEdits = {},
+  pageTextItems = {}
+) {
   const pdfDoc = await PDFDocument.load(originalPdfData, { ignoreEncryption: true })
   const pages = pdfDoc.getPages()
-  const font = await pdfDoc.embedFont(StandardFonts.Helvetica)
+
+  // Embed fonts upfront
+  const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica)
+  const helveticaBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold)
 
   for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
     const page = pages[pageIdx]
     const pageNum = pageIdx + 1
     const { width: pageWidth, height: pageHeight } = page.getSize()
-
-    // Calculate the viewport dimensions at the given scale
-    // We need to convert from screen coords (at viewScale) back to PDF coords
     const scaleFactor = viewScale
 
-    // Apply text annotations
+    // ──────────────────────────────────────────────
+    // 1. Apply inline text edits (whiteout + redraw)
+    // ──────────────────────────────────────────────
+    const items = pageTextItems[pageNum] || []
+    for (const item of items) {
+      const key = `${pageNum}-${item.id}`
+      if (!(key in textEdits)) continue
+      const newText = textEdits[key]
+      if (newText === item.originalStr) continue // no change
+
+      // Draw a white rectangle to cover the original text
+      const padding = 1
+      page.drawRectangle({
+        x: item.x - padding,
+        y: item.y - padding - (item.height * 0.15), // slight offset below baseline
+        width: item.width + padding * 2 + 10, // little extra to fully cover
+        height: item.height + padding * 2,
+        color: rgb(1, 1, 1), // white
+        borderWidth: 0,
+      })
+
+      // Choose font — try to match bold if font name suggests it
+      const isBold = item.fontName && /bold/i.test(item.fontName)
+      const font = isBold ? helveticaBold : helvetica
+
+      // Draw the new text at the same position
+      const fontSize = item.fontSize
+      try {
+        page.drawText(newText, {
+          x: item.x,
+          y: item.y,
+          size: fontSize,
+          font,
+          color: rgb(0, 0, 0),
+        })
+      } catch (err) {
+        // Fallback: some chars might not be in the standard font
+        // Try with basic ASCII filtering
+        const safeText = newText.replace(/[^\x20-\x7E]/g, '?')
+        page.drawText(safeText, {
+          x: item.x,
+          y: item.y,
+          size: fontSize,
+          font,
+          color: rgb(0, 0, 0),
+        })
+      }
+    }
+
+    // ──────────────────────────────────────
+    // 2. Apply text annotations (new boxes)
+    // ──────────────────────────────────────
     const pageAnnots = annotations[pageNum] || []
     for (const annot of pageAnnots) {
       if (annot.type === 'text' && annot.text.trim()) {
-        // Convert screen coords to PDF coords
         const pdfX = annot.x / scaleFactor
-        // PDF y-axis is from bottom, screen y is from top
         const pdfY = pageHeight - (annot.y / scaleFactor) - (annot.fontSize || 14)
-
         const lines = annot.text.split('\n')
         const fontSize = (annot.fontSize || 14) / scaleFactor * 0.75
         const colorHex = annot.color || '#000000'
@@ -40,7 +96,7 @@ export async function exportPdf(originalPdfData, annotations, formValues, formFi
             x: pdfX,
             y: pdfY - lineIdx * (fontSize * 1.4),
             size: fontSize,
-            font,
+            font: helvetica,
             color: rgb(r, g, b),
           })
         })
@@ -48,7 +104,6 @@ export async function exportPdf(originalPdfData, annotations, formValues, formFi
 
       if (annot.type === 'signature' && annot.dataUrl) {
         try {
-          // Decode the base64 data URL
           const base64Data = annot.dataUrl.split(',')[1]
           const imgBytes = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0))
           const pngImage = await pdfDoc.embedPng(imgBytes)
@@ -70,7 +125,9 @@ export async function exportPdf(originalPdfData, annotations, formValues, formFi
       }
     }
 
-    // Fill form field values by drawing text on top
+    // ──────────────────────────────────
+    // 3. Fill form field values
+    // ──────────────────────────────────
     const pageFormFields = formFields[pageNum] || []
     for (const field of pageFormFields) {
       const value = formValues[field.id]
@@ -78,7 +135,6 @@ export async function exportPdf(originalPdfData, annotations, formValues, formFi
 
       if (field.fieldType === 'Tx' && typeof value === 'string' && value.trim()) {
         const [x1, y1, x2, y2] = field.rect
-        const fieldWidth = x2 - x1
         const fieldHeight = y2 - y1
         const fontSize = Math.min(fieldHeight * 0.7, 12)
 
@@ -86,7 +142,7 @@ export async function exportPdf(originalPdfData, annotations, formValues, formFi
           x: x1 + 2,
           y: y1 + fieldHeight * 0.25,
           size: fontSize,
-          font,
+          font: helvetica,
           color: rgb(0, 0, 0),
         })
       }
@@ -97,31 +153,29 @@ export async function exportPdf(originalPdfData, annotations, formValues, formFi
         const midY = (y1 + y2) / 2
         const size = Math.min(x2 - x1, y2 - y1) * 0.6
 
-        page.drawText('✓', {
-          x: midX - size / 2,
-          y: midY - size / 2,
+        page.drawText('X', {
+          x: midX - size / 3,
+          y: midY - size / 3,
           size,
-          font,
+          font: helveticaBold,
           color: rgb(0, 0, 0),
         })
       }
     }
   }
 
-  // Try to flatten form fields so filled values show
+  // Flatten form fields
   try {
     const form = pdfDoc.getForm()
     const fields = form.getFields()
     for (const field of fields) {
       const name = field.getName()
-      // Set text field values from our form values
       for (const [, pageFieldList] of Object.entries(formFields)) {
         for (const pf of pageFieldList) {
           if (pf.fieldName === name && formValues[pf.id]) {
             try {
               if (pf.fieldType === 'Tx') {
-                const tf = form.getTextField(name)
-                tf.setText(formValues[pf.id])
+                form.getTextField(name).setText(formValues[pf.id])
               }
             } catch { /* field may not be settable */ }
           }
@@ -130,7 +184,7 @@ export async function exportPdf(originalPdfData, annotations, formValues, formFi
     }
     form.flatten()
   } catch {
-    // PDF may not have interactive form fields, that's fine
+    // PDF may not have interactive form fields
   }
 
   const pdfBytes = await pdfDoc.save()
