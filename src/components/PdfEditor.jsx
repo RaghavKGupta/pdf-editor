@@ -136,15 +136,20 @@ export default function PdfEditor({ pdfData, fileName }) {
     return () => { cancelled = true }
   }, [pdfData])
 
-  // Render pages
+  // Render pages at high DPI for sharp text
   useEffect(() => {
+    const dpr = window.devicePixelRatio || 1
     pages.forEach((page) => {
       const canvas = canvasRefs.current[page.pageNumber]
       if (!canvas) return
       const viewport = page.getViewport({ scale })
-      canvas.width = viewport.width
-      canvas.height = viewport.height
+      // Set canvas backing store to dpr × CSS size for crisp rendering
+      canvas.width = Math.floor(viewport.width * dpr)
+      canvas.height = Math.floor(viewport.height * dpr)
+      canvas.style.width = viewport.width + 'px'
+      canvas.style.height = viewport.height + 'px'
       const ctx = canvas.getContext('2d')
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
       page.render({ canvasContext: ctx, viewport }).promise
     })
   }, [pages, scale])

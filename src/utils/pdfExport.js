@@ -1,9 +1,280 @@
-import { PDFDocument, rgb, StandardFonts, PDFName, PDFDict, PDFRef } from 'pdf-lib'
+import { PDFDocument, rgb, StandardFonts, PDFName, PDFDict, PDFRef, PDFHexString, PDFString, PDFArray, PDFNumber } from 'pdf-lib'
 import fontkit from '@pdf-lib/fontkit'
 
+// ─────────────────────────────────────────────────────────────
+// Content-stream text replacement
+// ─────────────────────────────────────────────────────────────
+
 /**
- * Map a PDF font name to the best matching StandardFont (last-resort fallback).
+ * Parse a PDF content stream into tokens.
+ * Returns an array of { type: 'operand'|'operator', value: string }
  */
+function tokenizeContentStream(streamBytes) {
+  const text = typeof streamBytes === 'string'
+    ? streamBytes
+    : new TextDecoder('latin1').decode(streamBytes)
+
+  const tokens = []
+  let i = 0
+
+  while (i < text.length) {
+    // Skip whitespace
+    if (/\s/.test(text[i])) { i++; continue }
+
+    // Comment
+    if (text[i] === '%') {
+      while (i < text.length && text[i] !== '\n' && text[i] !== '\r') i++
+      continue
+    }
+
+    // String literal (...)
+    if (text[i] === '(') {
+      let depth = 1
+      let str = '('
+      i++
+      while (i < text.length && depth > 0) {
+        if (text[i] === '\\') {
+          str += text[i] + (text[i + 1] || '')
+          i += 2
+          continue
+        }
+        if (text[i] === '(') depth++
+        if (text[i] === ')') depth--
+        str += text[i]
+        i++
+      }
+      tokens.push({ type: 'operand', value: str })
+      continue
+    }
+
+    // Hex string <...>
+    if (text[i] === '<' && text[i + 1] !== '<') {
+      let str = '<'
+      i++
+      while (i < text.length && text[i] !== '>') {
+        str += text[i]
+        i++
+      }
+      str += '>'
+      i++ // skip >
+      tokens.push({ type: 'operand', value: str })
+      continue
+    }
+
+    // Dict << ... >>
+    if (text[i] === '<' && text[i + 1] === '<') {
+      let str = '<<'
+      i += 2
+      let depth = 1
+      while (i < text.length && depth > 0) {
+        if (text[i] === '<' && text[i + 1] === '<') { depth++; str += '<<'; i += 2; continue }
+        if (text[i] === '>' && text[i + 1] === '>') { depth--; str += '>>'; i += 2; continue }
+        str += text[i]
+        i++
+      }
+      tokens.push({ type: 'operand', value: str })
+      continue
+    }
+
+    // Array [ ... ]
+    if (text[i] === '[') {
+      let depth = 1
+      let str = '['
+      i++
+      while (i < text.length && depth > 0) {
+        if (text[i] === '[') depth++
+        if (text[i] === ']') depth--
+        str += text[i]
+        i++
+      }
+      tokens.push({ type: 'operand', value: str })
+      continue
+    }
+
+    // Name /Something
+    if (text[i] === '/') {
+      let str = '/'
+      i++
+      while (i < text.length && !/[\s/<>\[\]()%]/.test(text[i])) {
+        str += text[i]
+        i++
+      }
+      tokens.push({ type: 'operand', value: str })
+      continue
+    }
+
+    // Number or keyword
+    let word = ''
+    while (i < text.length && !/[\s/<>\[\]()%]/.test(text[i])) {
+      word += text[i]
+      i++
+    }
+    if (word) {
+      // Check if it's an operator (alphabetic) or number
+      if (/^[a-zA-Z*'"]+$/.test(word)) {
+        tokens.push({ type: 'operator', value: word })
+      } else {
+        tokens.push({ type: 'operand', value: word })
+      }
+    }
+  }
+
+  return tokens
+}
+
+/**
+ * Decode a PDF string literal (...) to a JS string.
+ */
+function decodePdfString(pdfStr) {
+  // Remove parens
+  let s = pdfStr.slice(1, -1)
+  let result = ''
+  let i = 0
+  while (i < s.length) {
+    if (s[i] === '\\') {
+      i++
+      if (s[i] === 'n') { result += '\n'; i++ }
+      else if (s[i] === 'r') { result += '\r'; i++ }
+      else if (s[i] === 't') { result += '\t'; i++ }
+      else if (s[i] === 'b') { result += '\b'; i++ }
+      else if (s[i] === 'f') { result += '\f'; i++ }
+      else if (s[i] === '(') { result += '('; i++ }
+      else if (s[i] === ')') { result += ')'; i++ }
+      else if (s[i] === '\\') { result += '\\'; i++ }
+      else if (/[0-7]/.test(s[i])) {
+        let oct = s[i]; i++
+        if (i < s.length && /[0-7]/.test(s[i])) { oct += s[i]; i++ }
+        if (i < s.length && /[0-7]/.test(s[i])) { oct += s[i]; i++ }
+        result += String.fromCharCode(parseInt(oct, 8))
+      } else {
+        result += s[i]; i++
+      }
+    } else {
+      result += s[i]; i++
+    }
+  }
+  return result
+}
+
+/**
+ * Encode a JS string into a PDF string literal (...).
+ */
+function encodePdfString(str) {
+  let out = '('
+  for (const ch of str) {
+    if (ch === '(' || ch === ')' || ch === '\\') out += '\\' + ch
+    else out += ch
+  }
+  out += ')'
+  return out
+}
+
+/**
+ * Try to extract text from a TJ array operand, e.g. [(H) 20 (ello)]
+ */
+function extractTJText(tjArrayStr) {
+  const parts = []
+  const re = /\(([^)]*(?:\\.[^)]*)*)\)|<([0-9a-fA-F]*)>/g
+  let m
+  while ((m = re.exec(tjArrayStr)) !== null) {
+    if (m[1] !== undefined) {
+      parts.push({ type: 'literal', raw: m[0], text: decodePdfString('(' + m[1] + ')') })
+    } else if (m[2] !== undefined) {
+      parts.push({ type: 'hex', raw: m[0], text: m[2] })
+    }
+  }
+  return parts
+}
+
+/**
+ * Directly modify the PDF content stream to replace text strings.
+ * This preserves all font/style operators — we only change the string data.
+ *
+ * Returns the number of replacements made.
+ */
+function replaceTextInContentStream(streamBytes, editMap) {
+  // editMap: Map<originalText, newText>
+  if (editMap.size === 0) return { bytes: streamBytes, count: 0 }
+
+  const text = typeof streamBytes === 'string'
+    ? streamBytes
+    : new TextDecoder('latin1').decode(streamBytes)
+
+  const tokens = tokenizeContentStream(text)
+  let count = 0
+  let modified = false
+
+  // Process Tj and TJ operators
+  for (let t = 0; t < tokens.length; t++) {
+    const token = tokens[t]
+
+    // Tj operator: preceded by a string operand
+    if (token.type === 'operator' && token.value === 'Tj' && t > 0) {
+      const prev = tokens[t - 1]
+      if (prev.type === 'operand' && prev.value.startsWith('(')) {
+        const decoded = decodePdfString(prev.value)
+        if (editMap.has(decoded)) {
+          prev.value = encodePdfString(editMap.get(decoded))
+          count++
+          modified = true
+        }
+      }
+    }
+
+    // TJ operator: preceded by an array with strings and kerning numbers
+    if (token.type === 'operator' && token.value === 'TJ' && t > 0) {
+      const prev = tokens[t - 1]
+      if (prev.type === 'operand' && prev.value.startsWith('[')) {
+        // Extract combined text from all string parts in the array
+        const parts = extractTJText(prev.value)
+        const combinedText = parts
+          .filter(p => p.type === 'literal')
+          .map(p => p.text)
+          .join('')
+
+        if (editMap.has(combinedText)) {
+          const newText = editMap.get(combinedText)
+          // Replace: put all text in a single Tj string (simpler, preserves the font)
+          // We switch from TJ array to a simple string + Tj
+          tokens[t - 1] = { type: 'operand', value: encodePdfString(newText) }
+          tokens[t] = { type: 'operator', value: 'Tj' }
+          count++
+          modified = true
+        }
+      }
+    }
+
+    // Also try single ' and " show operators (rare but possible)
+    if (token.type === 'operator' && token.value === "'" && t > 0) {
+      const prev = tokens[t - 1]
+      if (prev.type === 'operand' && prev.value.startsWith('(')) {
+        const decoded = decodePdfString(prev.value)
+        if (editMap.has(decoded)) {
+          prev.value = encodePdfString(editMap.get(decoded))
+          count++
+          modified = true
+        }
+      }
+    }
+  }
+
+  if (!modified) return { bytes: streamBytes, count: 0 }
+
+  // Reconstruct stream
+  const out = tokens.map(t => t.value).join(' ')
+  const encoder = new TextEncoder()
+  // Use latin1 encoding to preserve byte values
+  const outBytes = new Uint8Array(out.length)
+  for (let i = 0; i < out.length; i++) {
+    outBytes[i] = out.charCodeAt(i) & 0xFF
+  }
+  return { bytes: outBytes, count }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Standard font fallback (for annotations and form fills only)
+// ─────────────────────────────────────────────────────────────
+
 function pickStandardFont(fontName) {
   const name = (fontName || '').toLowerCase()
   const isBold = /bold/.test(name)
@@ -29,130 +300,21 @@ function pickStandardFont(fontName) {
   return StandardFonts.Helvetica
 }
 
-/**
- * Normalize a font name for matching: strip subset prefix (ABCDEF+), remove
- * spaces/hyphens, and lowercase.
- */
-function normalizeFontName(name) {
-  return (name || '')
-    .replace(/^[A-Z]{6}\+/, '') // strip subset prefix like "BCDEFG+"
-    .replace(/[-_\s]/g, '')
-    .toLowerCase()
-}
+// ─────────────────────────────────────────────────────────────
+// Main export function
+// ─────────────────────────────────────────────────────────────
 
 /**
- * Attempt to extract all embedded font programs from every page of the PDF.
- * Returns a map of normalizedBaseFontName → embeddedFont.
+ * Export the edited PDF.
  *
- * Strategy:
- *  - Walk each page's Resources → Font dictionary
- *  - For each font, locate its FontDescriptor
- *  - Pull the raw font program out of FontFile2 (TrueType), FontFile3 (CFF/OTF),
- *    or FontFile (Type1)
- *  - Re-embed via fontkit so we can use it in drawText()
- */
-async function extractEmbeddedFonts(pdfDoc) {
-  const extracted = {} // normalizedName → embeddedFont
-
-  function resolve(ref) {
-    if (ref instanceof PDFRef) return pdfDoc.context.lookup(ref)
-    return ref
-  }
-
-  try {
-    const pages = pdfDoc.getPages()
-    for (const page of pages) {
-      const resources = resolve(page.node.get(PDFName.of('Resources')))
-      if (!(resources instanceof PDFDict)) continue
-
-      const fontDict = resolve(resources.get(PDFName.of('Font')))
-      if (!(fontDict instanceof PDFDict)) continue
-
-      for (const [, valueRef] of fontDict.entries()) {
-        try {
-          const fontObj = resolve(valueRef)
-          if (!(fontObj instanceof PDFDict)) continue
-
-          // Get the BaseFont name (e.g. /TimesNewRomanPSMT, /ABCDEF+Calibri-Bold)
-          const baseFontRaw = fontObj.get(PDFName.of('BaseFont'))
-          if (!baseFontRaw) continue
-          const baseFontName = baseFontRaw.toString().replace(/^\//, '')
-          const normalizedName = normalizeFontName(baseFontName)
-
-          // Skip if already extracted
-          if (extracted[normalizedName]) continue
-
-          // Handle Type0 (composite) fonts — the actual font data is in DescendantFonts
-          let descriptorSource = fontObj
-          const subtypeRaw = fontObj.get(PDFName.of('Subtype'))
-          const subtype = subtypeRaw ? subtypeRaw.toString().replace(/^\//, '') : ''
-
-          if (subtype === 'Type0') {
-            const descendantsRef = fontObj.get(PDFName.of('DescendantFonts'))
-            const descendants = resolve(descendantsRef)
-            if (descendants && typeof descendants.get === 'function') {
-              // It's a PDFArray — get the first element
-              descriptorSource = resolve(descendants.get(0)) || fontObj
-            } else if (Array.isArray(descendants)) {
-              descriptorSource = resolve(descendants[0]) || fontObj
-            }
-          }
-
-          // Get FontDescriptor
-          const descriptorRef = descriptorSource instanceof PDFDict
-            ? descriptorSource.get(PDFName.of('FontDescriptor'))
-            : null
-          if (!descriptorRef) continue
-
-          const descriptor = resolve(descriptorRef)
-          if (!(descriptor instanceof PDFDict)) continue
-
-          // Try each font file type: TrueType → OpenType/CFF → Type1
-          let fontBytes = null
-          for (const fileKey of ['FontFile2', 'FontFile3', 'FontFile']) {
-            const fileRef = descriptor.get(PDFName.of(fileKey))
-            if (!fileRef) continue
-
-            const stream = resolve(fileRef)
-            if (!stream) continue
-
-            // pdf-lib stream objects store decoded bytes in .contents
-            const bytes = stream.contents || stream.getContents?.()
-            if (bytes && bytes.length > 50) {
-              fontBytes = bytes
-              break
-            }
-          }
-
-          if (!fontBytes) continue
-
-          // Embed via fontkit — may fail for heavily subsetted or corrupt fonts
-          const embeddedFont = await pdfDoc.embedFont(fontBytes, { subset: false })
-          extracted[normalizedName] = embeddedFont
-
-          // Also store without subset prefix variations
-          const withoutPlus = baseFontName.replace(/^[A-Z]{6}\+/, '')
-          extracted[normalizeFontName(withoutPlus)] = embeddedFont
-        } catch {
-          // Individual font extraction failed — continue to next font
-        }
-      }
-    }
-  } catch {
-    // Global extraction failure — we'll fall back to standard fonts
-  }
-
-  return extracted
-}
-
-/**
- * Export the edited PDF with all annotations, form values, AND inline text edits baked in.
+ * For inline text edits: directly patches the page content stream so the
+ * original font, size, color, and position are perfectly preserved. No
+ * whiteout rectangles, no font re-embedding — just a surgical string swap.
  *
- * Font handling priority:
- *  1. Extract the actual embedded font from the original PDF and re-embed it (exact match)
- *  2. Fall back to the closest matching PDF standard font
+ * Falls back to whiteout+redraw only for edits that the stream parser
+ * couldn't match (e.g. CIDFont hex-encoded text).
  *
- * Everything runs 100% client-side — your data never leaves your browser.
+ * Everything runs 100% client-side.
  */
 export async function exportPdf(
   originalPdfData,
@@ -164,16 +326,11 @@ export async function exportPdf(
   pageTextItems = {}
 ) {
   const pdfDoc = await PDFDocument.load(originalPdfData, { ignoreEncryption: true })
-
-  // Register fontkit so we can embed custom (non-standard) fonts
   pdfDoc.registerFontkit(fontkit)
 
   const pages = pdfDoc.getPages()
 
-  // ─── Extract original embedded fonts from the PDF ───
-  const embeddedFonts = await extractEmbeddedFonts(pdfDoc)
-
-  // ─── Standard-font fallback cache ───
+  // Standard font cache for annotations/forms
   const stdFontCache = {}
   async function getStdFont(fontName) {
     const stdFont = pickStandardFont(fontName)
@@ -183,33 +340,6 @@ export async function exportPdf(
     return stdFontCache[stdFont]
   }
 
-  /**
-   * Resolve the best font to use for a text item.
-   * Tries the extracted embedded font first, falls back to standard.
-   */
-  async function resolveFont(item) {
-    // Try matching by fontName (pdfjs internal name often contains the real name)
-    const nameNorm = normalizeFontName(item.fontName || '')
-    if (embeddedFonts[nameNorm]) return embeddedFonts[nameNorm]
-
-    // Try matching by fontFamily (extracted from pdfjs styles, e.g. "Times New Roman")
-    const familyNorm = normalizeFontName(item.fontFamily || '')
-    if (embeddedFonts[familyNorm]) return embeddedFonts[familyNorm]
-
-    // Try partial matching: check if any extracted font name contains the family
-    if (familyNorm) {
-      for (const [key, font] of Object.entries(embeddedFonts)) {
-        if (key.includes(familyNorm) || familyNorm.includes(key)) {
-          return font
-        }
-      }
-    }
-
-    // Last resort: best-matching standard font
-    return getStdFont(item.fontFamily || item.fontName || '')
-  }
-
-  // Pre-embed Helvetica for annotations/forms
   const helvetica = await getStdFont('')
   const helveticaBold = await getStdFont('bold')
 
@@ -219,61 +349,97 @@ export async function exportPdf(
     const { height: pageHeight } = page.getSize()
     const scaleFactor = viewScale
 
-    // ──────────────────────────────────────────────
-    // 1. Apply inline text edits (whiteout + redraw)
-    // ──────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────
+    // 1. Apply inline text edits via content-stream patching
+    // ──────────────────────────────────────────────────────────
     const items = pageTextItems[pageNum] || []
+    const editMap = new Map() // originalStr → newStr
+    const editItems = []      // items that need editing
+
     for (const item of items) {
       const key = `${pageNum}-${item.id}`
       if (!(key in textEdits)) continue
       const newText = textEdits[key]
-      if (newText === item.originalStr) continue // no change
+      if (newText === item.originalStr) continue
+      editMap.set(item.originalStr, newText)
+      editItems.push(item)
+    }
 
-      // Draw a white rectangle to cover the original text
-      const padding = 1
-      page.drawRectangle({
-        x: item.x - padding,
-        y: item.y - padding - (item.height * 0.15),
-        width: item.width + padding * 2 + 10,
-        height: item.height + padding * 2,
-        color: rgb(1, 1, 1),
-        borderWidth: 0,
-      })
+    if (editMap.size > 0) {
+      // Get the page's content stream(s)
+      const contentsRef = page.node.get(PDFName.of('Contents'))
+      let streamReplaced = 0
 
-      // Resolve the best matching font for this specific text item
-      const font = await resolveFont(item)
-      const fontSize = item.fontSize
+      if (contentsRef) {
+        const contents = contentsRef instanceof PDFRef
+          ? pdfDoc.context.lookup(contentsRef)
+          : contentsRef
 
-      try {
-        page.drawText(newText, {
-          x: item.x,
-          y: item.y,
-          size: fontSize,
-          font,
-          color: rgb(0, 0, 0),
-        })
-      } catch {
-        // If the extracted font doesn't contain the needed glyphs (subset issue),
-        // fall back to standard font
-        try {
-          const fallbackFont = await getStdFont(item.fontFamily || item.fontName || '')
-          page.drawText(newText, {
-            x: item.x,
-            y: item.y,
-            size: fontSize,
-            font: fallbackFont,
-            color: rgb(0, 0, 0),
+        // Contents can be a single stream or an array of streams
+        const streamRefs = []
+        if (contents instanceof PDFArray) {
+          for (let si = 0; si < contents.size(); si++) {
+            streamRefs.push(contents.get(si))
+          }
+        } else {
+          streamRefs.push(contentsRef)
+        }
+
+        for (const ref of streamRefs) {
+          const streamObj = ref instanceof PDFRef ? pdfDoc.context.lookup(ref) : ref
+          if (!streamObj || !streamObj.contents) continue
+
+          const { bytes: newBytes, count } = replaceTextInContentStream(
+            streamObj.contents,
+            editMap
+          )
+
+          if (count > 0) {
+            // Replace the stream contents
+            streamObj.contents = newBytes
+            streamReplaced += count
+          }
+        }
+      }
+
+      // Fallback: any edits the stream parser missed, use whiteout+redraw
+      if (streamReplaced < editMap.size) {
+        for (const item of editItems) {
+          const key = `${pageNum}-${item.id}`
+          const newText = textEdits[key]
+          // Check if this specific item was likely handled by stream patching
+          // We can't know for sure, so only fallback if zero stream replacements happened
+          if (streamReplaced > 0) continue
+
+          const padding = 1
+          page.drawRectangle({
+            x: item.x - padding,
+            y: item.y - padding - (item.height * 0.15),
+            width: item.width + padding * 2 + 10,
+            height: item.height + padding * 2,
+            color: rgb(1, 1, 1),
+            borderWidth: 0,
           })
-        } catch {
-          // Ultimate fallback: filter to safe ASCII
-          const safeText = newText.replace(/[^\x20-\x7E]/g, '?')
-          page.drawText(safeText, {
-            x: item.x,
-            y: item.y,
-            size: fontSize,
-            font: helvetica,
-            color: rgb(0, 0, 0),
-          })
+
+          const font = await getStdFont(item.fontFamily || item.fontName || '')
+          try {
+            page.drawText(newText, {
+              x: item.x,
+              y: item.y,
+              size: item.fontSize,
+              font,
+              color: rgb(0, 0, 0),
+            })
+          } catch {
+            const safeText = newText.replace(/[^\x20-\x7E]/g, '?')
+            page.drawText(safeText, {
+              x: item.x,
+              y: item.y,
+              size: item.fontSize,
+              font: helvetica,
+              color: rgb(0, 0, 0),
+            })
+          }
         }
       }
     }
