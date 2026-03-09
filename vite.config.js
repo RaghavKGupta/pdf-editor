@@ -8,7 +8,7 @@ export default defineConfig({
       output: {
         manualChunks: {
           pdfjs: ['pdfjs-dist'],
-          pdflib: ['pdf-lib'],
+          pdflib: ['pdf-lib', '@pdf-lib/fontkit'],
         },
       },
     },

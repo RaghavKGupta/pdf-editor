@@ -80,11 +80,12 @@ export default function PdfEditor({ pdfData, fileName }) {
         }
         setFormValues(values)
 
-        // Extract text content from each page
+        // Extract text content from each page, including font style info
         const allTextItems = {}
         for (const page of loadedPages) {
           const textContent = await page.getTextContent()
           const viewport = page.getViewport({ scale: 1 }) // base scale=1 for PDF coords
+          const styles = textContent.styles || {} // fontName → { fontFamily, ascent, descent }
           const items = []
 
           textContent.items.forEach((item, idx) => {
@@ -100,6 +101,10 @@ export default function PdfEditor({ pdfData, fileName }) {
             const width = item.width
             const height = item.height || fontSize * 1.2
 
+            // Get CSS font family from pdfjs style info
+            const style = styles[item.fontName] || {}
+            const fontFamily = style.fontFamily || ''
+
             items.push({
               id: idx,
               str: item.str,
@@ -109,6 +114,7 @@ export default function PdfEditor({ pdfData, fileName }) {
               height,
               fontSize,
               fontName: item.fontName || '',
+              fontFamily, // actual CSS font family from the PDF
               transform: tx,
               // Store original for export diffing
               originalStr: item.str,

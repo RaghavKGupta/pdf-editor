@@ -1,15 +1,14 @@
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib'
+import { PDFDocument, rgb, StandardFonts, PDFName, PDFDict, PDFRef } from 'pdf-lib'
+import fontkit from '@pdf-lib/fontkit'
 
 /**
- * Map a PDF font name to the best matching StandardFont.
- * PDF font names often look like "ABCDEF+TimesNewRoman-Bold" or "ArialMT" etc.
+ * Map a PDF font name to the best matching StandardFont (last-resort fallback).
  */
 function pickStandardFont(fontName) {
   const name = (fontName || '').toLowerCase()
   const isBold = /bold/.test(name)
   const isItalic = /italic|oblique/.test(name)
 
-  // Times / Serif family
   if (/times|serif|roman|garamond|georgia|cambria|palatino/.test(name)) {
     if (isBold && isItalic) return StandardFonts.TimesRomanBoldItalic
     if (isBold) return StandardFonts.TimesRomanBold
@@ -17,7 +16,6 @@ function pickStandardFont(fontName) {
     return StandardFonts.TimesRoman
   }
 
-  // Courier / Monospace family
   if (/courier|mono|consolas|menlo|source\s?code/.test(name)) {
     if (isBold && isItalic) return StandardFonts.CourierBoldOblique
     if (isBold) return StandardFonts.CourierBold
@@ -25,7 +23,6 @@ function pickStandardFont(fontName) {
     return StandardFonts.Courier
   }
 
-  // Default: Helvetica / Sans-serif (covers Arial, Helvetica, Calibri, etc.)
   if (isBold && isItalic) return StandardFonts.HelveticaBoldOblique
   if (isBold) return StandardFonts.HelveticaBold
   if (isItalic) return StandardFonts.HelveticaOblique
@@ -33,10 +30,129 @@ function pickStandardFont(fontName) {
 }
 
 /**
+ * Normalize a font name for matching: strip subset prefix (ABCDEF+), remove
+ * spaces/hyphens, and lowercase.
+ */
+function normalizeFontName(name) {
+  return (name || '')
+    .replace(/^[A-Z]{6}\+/, '') // strip subset prefix like "BCDEFG+"
+    .replace(/[-_\s]/g, '')
+    .toLowerCase()
+}
+
+/**
+ * Attempt to extract all embedded font programs from every page of the PDF.
+ * Returns a map of normalizedBaseFontName → embeddedFont.
+ *
+ * Strategy:
+ *  - Walk each page's Resources → Font dictionary
+ *  - For each font, locate its FontDescriptor
+ *  - Pull the raw font program out of FontFile2 (TrueType), FontFile3 (CFF/OTF),
+ *    or FontFile (Type1)
+ *  - Re-embed via fontkit so we can use it in drawText()
+ */
+async function extractEmbeddedFonts(pdfDoc) {
+  const extracted = {} // normalizedName → embeddedFont
+
+  function resolve(ref) {
+    if (ref instanceof PDFRef) return pdfDoc.context.lookup(ref)
+    return ref
+  }
+
+  try {
+    const pages = pdfDoc.getPages()
+    for (const page of pages) {
+      const resources = resolve(page.node.get(PDFName.of('Resources')))
+      if (!(resources instanceof PDFDict)) continue
+
+      const fontDict = resolve(resources.get(PDFName.of('Font')))
+      if (!(fontDict instanceof PDFDict)) continue
+
+      for (const [, valueRef] of fontDict.entries()) {
+        try {
+          const fontObj = resolve(valueRef)
+          if (!(fontObj instanceof PDFDict)) continue
+
+          // Get the BaseFont name (e.g. /TimesNewRomanPSMT, /ABCDEF+Calibri-Bold)
+          const baseFontRaw = fontObj.get(PDFName.of('BaseFont'))
+          if (!baseFontRaw) continue
+          const baseFontName = baseFontRaw.toString().replace(/^\//, '')
+          const normalizedName = normalizeFontName(baseFontName)
+
+          // Skip if already extracted
+          if (extracted[normalizedName]) continue
+
+          // Handle Type0 (composite) fonts — the actual font data is in DescendantFonts
+          let descriptorSource = fontObj
+          const subtypeRaw = fontObj.get(PDFName.of('Subtype'))
+          const subtype = subtypeRaw ? subtypeRaw.toString().replace(/^\//, '') : ''
+
+          if (subtype === 'Type0') {
+            const descendantsRef = fontObj.get(PDFName.of('DescendantFonts'))
+            const descendants = resolve(descendantsRef)
+            if (descendants && typeof descendants.get === 'function') {
+              // It's a PDFArray — get the first element
+              descriptorSource = resolve(descendants.get(0)) || fontObj
+            } else if (Array.isArray(descendants)) {
+              descriptorSource = resolve(descendants[0]) || fontObj
+            }
+          }
+
+          // Get FontDescriptor
+          const descriptorRef = descriptorSource instanceof PDFDict
+            ? descriptorSource.get(PDFName.of('FontDescriptor'))
+            : null
+          if (!descriptorRef) continue
+
+          const descriptor = resolve(descriptorRef)
+          if (!(descriptor instanceof PDFDict)) continue
+
+          // Try each font file type: TrueType → OpenType/CFF → Type1
+          let fontBytes = null
+          for (const fileKey of ['FontFile2', 'FontFile3', 'FontFile']) {
+            const fileRef = descriptor.get(PDFName.of(fileKey))
+            if (!fileRef) continue
+
+            const stream = resolve(fileRef)
+            if (!stream) continue
+
+            // pdf-lib stream objects store decoded bytes in .contents
+            const bytes = stream.contents || stream.getContents?.()
+            if (bytes && bytes.length > 50) {
+              fontBytes = bytes
+              break
+            }
+          }
+
+          if (!fontBytes) continue
+
+          // Embed via fontkit — may fail for heavily subsetted or corrupt fonts
+          const embeddedFont = await pdfDoc.embedFont(fontBytes, { subset: false })
+          extracted[normalizedName] = embeddedFont
+
+          // Also store without subset prefix variations
+          const withoutPlus = baseFontName.replace(/^[A-Z]{6}\+/, '')
+          extracted[normalizeFontName(withoutPlus)] = embeddedFont
+        } catch {
+          // Individual font extraction failed — continue to next font
+        }
+      }
+    }
+  } catch {
+    // Global extraction failure — we'll fall back to standard fonts
+  }
+
+  return extracted
+}
+
+/**
  * Export the edited PDF with all annotations, form values, AND inline text edits baked in.
- * For text edits: draws a white rectangle over the original text, then draws the new text.
- * Tries to match the original font family as closely as possible using PDF standard fonts.
- * Everything runs client-side.
+ *
+ * Font handling priority:
+ *  1. Extract the actual embedded font from the original PDF and re-embed it (exact match)
+ *  2. Fall back to the closest matching PDF standard font
+ *
+ * Everything runs 100% client-side — your data never leaves your browser.
  */
 export async function exportPdf(
   originalPdfData,
@@ -48,26 +164,59 @@ export async function exportPdf(
   pageTextItems = {}
 ) {
   const pdfDoc = await PDFDocument.load(originalPdfData, { ignoreEncryption: true })
+
+  // Register fontkit so we can embed custom (non-standard) fonts
+  pdfDoc.registerFontkit(fontkit)
+
   const pages = pdfDoc.getPages()
 
-  // Cache embedded fonts to avoid embedding the same font multiple times
-  const fontCache = {}
-  async function getFont(fontName) {
+  // ─── Extract original embedded fonts from the PDF ───
+  const embeddedFonts = await extractEmbeddedFonts(pdfDoc)
+
+  // ─── Standard-font fallback cache ───
+  const stdFontCache = {}
+  async function getStdFont(fontName) {
     const stdFont = pickStandardFont(fontName)
-    if (!fontCache[stdFont]) {
-      fontCache[stdFont] = await pdfDoc.embedFont(stdFont)
+    if (!stdFontCache[stdFont]) {
+      stdFontCache[stdFont] = await pdfDoc.embedFont(stdFont)
     }
-    return fontCache[stdFont]
+    return stdFontCache[stdFont]
+  }
+
+  /**
+   * Resolve the best font to use for a text item.
+   * Tries the extracted embedded font first, falls back to standard.
+   */
+  async function resolveFont(item) {
+    // Try matching by fontName (pdfjs internal name often contains the real name)
+    const nameNorm = normalizeFontName(item.fontName || '')
+    if (embeddedFonts[nameNorm]) return embeddedFonts[nameNorm]
+
+    // Try matching by fontFamily (extracted from pdfjs styles, e.g. "Times New Roman")
+    const familyNorm = normalizeFontName(item.fontFamily || '')
+    if (embeddedFonts[familyNorm]) return embeddedFonts[familyNorm]
+
+    // Try partial matching: check if any extracted font name contains the family
+    if (familyNorm) {
+      for (const [key, font] of Object.entries(embeddedFonts)) {
+        if (key.includes(familyNorm) || familyNorm.includes(key)) {
+          return font
+        }
+      }
+    }
+
+    // Last resort: best-matching standard font
+    return getStdFont(item.fontFamily || item.fontName || '')
   }
 
   // Pre-embed Helvetica for annotations/forms
-  const helvetica = await getFont('')
-  const helveticaBold = await getFont('bold')
+  const helvetica = await getStdFont('')
+  const helveticaBold = await getStdFont('bold')
 
   for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
     const page = pages[pageIdx]
     const pageNum = pageIdx + 1
-    const { width: pageWidth, height: pageHeight } = page.getSize()
+    const { height: pageHeight } = page.getSize()
     const scaleFactor = viewScale
 
     // ──────────────────────────────────────────────
@@ -84,18 +233,17 @@ export async function exportPdf(
       const padding = 1
       page.drawRectangle({
         x: item.x - padding,
-        y: item.y - padding - (item.height * 0.15), // slight offset below baseline
-        width: item.width + padding * 2 + 10, // little extra to fully cover
+        y: item.y - padding - (item.height * 0.15),
+        width: item.width + padding * 2 + 10,
         height: item.height + padding * 2,
-        color: rgb(1, 1, 1), // white
+        color: rgb(1, 1, 1),
         borderWidth: 0,
       })
 
-      // Choose the closest matching standard font based on the original font name
-      const font = await getFont(item.fontName)
-
-      // Draw the new text at the same position
+      // Resolve the best matching font for this specific text item
+      const font = await resolveFont(item)
       const fontSize = item.fontSize
+
       try {
         page.drawText(newText, {
           x: item.x,
@@ -104,17 +252,29 @@ export async function exportPdf(
           font,
           color: rgb(0, 0, 0),
         })
-      } catch (err) {
-        // Fallback: some chars might not be in the standard font
-        // Try with basic ASCII filtering
-        const safeText = newText.replace(/[^\x20-\x7E]/g, '?')
-        page.drawText(safeText, {
-          x: item.x,
-          y: item.y,
-          size: fontSize,
-          font,
-          color: rgb(0, 0, 0),
-        })
+      } catch {
+        // If the extracted font doesn't contain the needed glyphs (subset issue),
+        // fall back to standard font
+        try {
+          const fallbackFont = await getStdFont(item.fontFamily || item.fontName || '')
+          page.drawText(newText, {
+            x: item.x,
+            y: item.y,
+            size: fontSize,
+            font: fallbackFont,
+            color: rgb(0, 0, 0),
+          })
+        } catch {
+          // Ultimate fallback: filter to safe ASCII
+          const safeText = newText.replace(/[^\x20-\x7E]/g, '?')
+          page.drawText(safeText, {
+            x: item.x,
+            y: item.y,
+            size: fontSize,
+            font: helvetica,
+            color: rgb(0, 0, 0),
+          })
+        }
       }
     }
 
@@ -176,7 +336,7 @@ export async function exportPdf(
       if (!value) continue
 
       if (field.fieldType === 'Tx' && typeof value === 'string' && value.trim()) {
-        const [x1, y1, x2, y2] = field.rect
+        const [x1, y1, , y2] = field.rect
         const fieldHeight = y2 - y1
         const fontSize = Math.min(fieldHeight * 0.7, 12)
 

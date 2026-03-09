@@ -128,9 +128,12 @@ export default function TextEditLayer({
                     display: 'inline-block',
                     padding: '0 2px',
                     whiteSpace: 'nowrap',
-                    fontFamily: 'Helvetica, Arial, sans-serif',
-                    fontWeight: item.fontName && /bold/i.test(item.fontName) ? 'bold' : 'normal',
-                    fontStyle: item.fontName && /italic|oblique/i.test(item.fontName) ? 'italic' : 'normal',
+                    // Use the actual font family extracted from the PDF when available
+                    fontFamily: item.fontFamily
+                      ? `"${item.fontFamily}", serif, sans-serif`
+                      : 'Helvetica, Arial, sans-serif',
+                    fontWeight: /bold/i.test(item.fontName || item.fontFamily || '') ? 'bold' : 'normal',
+                    fontStyle: /italic|oblique/i.test(item.fontName || item.fontFamily || '') ? 'italic' : 'normal',
                   } : {})
                 }}
                 title={edited ? `Original: "${item.originalStr}"` : 'Click to edit'}
